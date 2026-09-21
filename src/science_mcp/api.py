@@ -64,6 +64,35 @@ class ScienceAPI:
                 "connection_error", "Could not read the Science API response"
             ) from error
 
+    def lookup(self, query: str, kind: str, limit: int, after_id: int) -> dict:
+        return self.software("lookup", q=query, kind=kind, limit=limit, after_id=after_id)
+
+    def search(self, query: str, limit: int, after_id: int) -> dict:
+        return self.software("search", q=query, limit=limit, after_id=after_id)
+
+    def software(self, action: str, **query) -> dict:
+        data, _, url = self.get(f"software/{action}", **query)
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("projects"), list)
+            or not all(
+                isinstance(item, dict) and type(item.get("project_id")) is int
+                for item in data["projects"]
+            )
+            or "next_after_id" not in data
+            or (
+                data["next_after_id"] is not None
+                and (type(data["next_after_id"]) is not int or data["next_after_id"] <= 0)
+            )
+        ):
+            raise ScienceError("invalid_response", "Science returned invalid software results")
+        return {
+            **data,
+            "source": "api",
+            "url": url,
+            "retrieved_at": datetime.now(UTC).isoformat(),
+        }
+
     def seeds(self, page: int, per_page: int) -> dict:
         data, headers, url = self.get("projects/search_seeds", page=page, per_page=per_page)
         if not isinstance(data, list) or not all(

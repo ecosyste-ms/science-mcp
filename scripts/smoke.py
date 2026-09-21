@@ -28,11 +28,14 @@ async def main():
                 "tools": [tool.name for tool in tools.tools],
                 "context": context.structured_content,
             }
-            if os.environ.get("SCIENCE_SEEDS_DB"):
-                lookup = await client.call_tool("lookup_software", {"query": "orbdot", "limit": 5})
-                if lookup.is_error:
-                    raise RuntimeError(lookup.content)
-                summary["lookup"] = lookup.structured_content
+            lookup = await client.call_tool("lookup_software", {"query": "orbdot", "limit": 5})
+            if lookup.is_error:
+                raise RuntimeError(lookup.content)
+            summary["lookup"] = lookup.structured_content
+            search = await client.call_tool("search_software", {"query": "orbdot", "limit": 5})
+            if search.is_error:
+                raise RuntimeError(search.content)
+            summary["search"] = search.structured_content
             print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 

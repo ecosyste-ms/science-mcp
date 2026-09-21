@@ -51,7 +51,7 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
         async with self.client() as client:
             tools = (await client.list_tools()).tools
             self.assertEqual(
-                {"lookup_software", "list_seed_projects", "get_project_context"},
+                {"lookup_software", "search_software", "list_seed_projects", "get_project_context"},
                 {tool.name for tool in tools},
             )
             for tool in tools:
@@ -197,12 +197,65 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
             data = await self.call(client, "lookup_software", {"query": "stats"})
         self.assertEqual(1, data["schema_version"])
 
-    async def test_missing_snapshot_is_an_actionable_tool_error_and_api_still_works(self):
+    async def test_lookup_uses_the_api_without_a_snapshot(self):
+        path = "/api/v1/software/lookup?q=STATS&kind=name&limit=1&after_id=0"
+        page = {
+            "query": "stats",
+            "kind": "name",
+            "match": "exact",
+            "next_after_id": 12,
+            "projects": [
+                {"project_id": 12, "seeds": [{"value": "Stats", "source": "project.name"}]}
+            ],
+        }
+        self.api.responses[path] = (200, {}, page)
+        next_path = "/api/v1/software/lookup?q=STATS&kind=name&limit=1&after_id=12"
+        self.api.responses[next_path] = (200, {}, {**page, "projects": [], "next_after_id": None})
         async with self.client(SCIENCE_SEEDS_DB="") as client:
-            result = await client.call_tool("lookup_software", {"query": "stats"})
-            self.assertTrue(result.is_error)
-            self.assertEqual("snapshot_not_configured", result.structured_content["error"])
-            await self.call(client, "get_project_context", {"project_id": 1})
+            first = await self.call(client, "lookup_software", {"query": "STATS", "limit": 1})
+            self.assertEqual("api", first["source"])
+            self.assertEqual(page["projects"], first["projects"])
+            self.assertIn("retrieved_at", first)
+            second = await self.call(
+                client,
+                "lookup_software",
+                {"query": "STATS", "limit": 1, "after_id": first["next_after_id"]},
+            )
+            self.assertIsNone(second["next_after_id"])
+        self.assertEqual([path, next_path], self.api.requests)
+
+    async def test_name_search_always_uses_the_api_and_encodes_query(self):
+        path = "/api/v1/software/search?q=R%2B%2B&limit=10&after_id=0"
+        self.api.responses[path] = (
+            200,
+            {},
+            {
+                "query": "r++",
+                "kind": "name",
+                "match": "contains",
+                "next_after_id": None,
+                "projects": [{"project_id": 12}],
+            },
+        )
+        async with self.client() as client:
+            data = await self.call(client, "search_software", {"query": "R++"})
+        self.assertEqual("api", data["source"])
+        self.assertEqual([12], [item["project_id"] for item in data["projects"]])
+        self.assertEqual([path], self.api.requests)
+
+    async def test_live_lookup_errors_are_reported_without_snapshot_fallback(self):
+        path = "/api/v1/software/lookup?q=stats&kind=name&limit=10&after_id=0"
+        async with self.client(SCIENCE_SEEDS_DB="") as client:
+            for status, body, error in [
+                (404, {}, "not_found"),
+                (429, {}, "rate_limited"),
+                (200, [], "invalid_response"),
+                (200, {"projects": [], "next_after_id": "bad"}, "invalid_response"),
+            ]:
+                self.api.responses[path] = (status, {}, body)
+                result = await client.call_tool("lookup_software", {"query": "stats"})
+                self.assertTrue(result.is_error)
+                self.assertEqual(error, result.structured_content["error"])
 
     async def test_missing_snapshot_path_does_not_create_a_file(self):
         path = str(Path(self.directory.name) / "missing.sqlite3")
@@ -259,6 +312,7 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
                 ("list_seed_projects", {"page": 0}),
                 ("list_seed_projects", {"per_page": 100}),
                 ("lookup_software", {"query": "stats", "kind": "sql"}),
+                ("search_software", {"query": "st"}),
             ]:
                 with self.subTest(arguments=arguments):
                     result = await client.call_tool(tool, arguments)
