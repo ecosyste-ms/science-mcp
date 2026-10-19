@@ -38,11 +38,17 @@ class ScienceAPI:
         self.base_url = base_url.rstrip("/")
 
     def get(self, path: str, **query) -> tuple[object, object, str]:
+        return self.request(path, query=query)
+
+    def request(self, path: str, *, query=None, body=None) -> tuple[object, object, str]:
         url = f"{self.base_url}/{path}"
         if query:
             url += "?" + urlencode(query)
+        headers = {"Accept": "application/json", "User-Agent": f"science-mcp/{__version__}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         request = Request(
-            url, headers={"Accept": "application/json", "User-Agent": f"science-mcp/{__version__}"}
+            url, headers=headers, data=json.dumps(body).encode() if body is not None else None
         )
         try:
             with build_opener(NoRedirect).open(request, timeout=15) as response:
@@ -63,6 +69,37 @@ class ScienceAPI:
             raise ScienceError(
                 "connection_error", "Could not read the Science API response"
             ) from error
+
+    def provenance(self, url: str) -> dict:
+        return {"source": "api", "url": url, "retrieved_at": datetime.now(UTC).isoformat()}
+
+    def collection(self, path: str, page: int, per_page: int, **query) -> dict:
+        data, headers, url = self.get(path, page=page, per_page=per_page, **query)
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise ScienceError("invalid_response", "Science returned an invalid collection")
+        if len(data) > per_page:
+            raise ScienceError("invalid_response", "Science did not honor the requested page size")
+        return {
+            **self.provenance(url),
+            "page": page,
+            "per_page": per_page,
+            "next_page": page + 1
+            if re.search(r';\s*rel="next"', headers.get("Link", ""))
+            else None,
+            "items": data,
+        }
+
+    def record(self, path: str, **query) -> dict:
+        data, _, url = self.get(path, **query)
+        if not isinstance(data, dict):
+            raise ScienceError("invalid_response", "Science returned an invalid record")
+        return {**self.provenance(url), "record": data}
+
+    def bulk_lookup(self, resource: str, key: str, values: list[str]) -> dict:
+        data, _, url = self.request(f"{resource}/bulk_lookup", body={key: values})
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise ScienceError("invalid_response", "Science returned invalid bulk lookup results")
+        return {**self.provenance(url), "inputs": values, "items": data}
 
     def lookup(self, query: str, kind: str, limit: int, after_id: int) -> dict:
         return self.software("lookup", q=query, kind=kind, limit=limit, after_id=after_id)

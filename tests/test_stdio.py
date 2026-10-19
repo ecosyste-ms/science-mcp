@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -51,12 +53,269 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
         async with self.client() as client:
             tools = (await client.list_tools()).tools
             self.assertEqual(
-                {"lookup_software", "search_software", "list_seed_projects", "get_project_context"},
+                {
+                    "lookup_software",
+                    "search_software",
+                    "list_seed_projects",
+                    "get_project_context",
+                    "get_project_external_identifiers",
+                    "get_project_swhids",
+                    "bulk_lookup_projects",
+                    "bulk_lookup_packages",
+                    "list_packages",
+                    "list_package_versions",
+                    "get_package_version",
+                    "get_package_repositories",
+                    "search_research_organizations",
+                    "get_research_organization",
+                    "list_research_accounts",
+                },
                 {tool.name for tool in tools},
             )
             for tool in tools:
                 self.assertTrue(tool.annotations.read_only_hint)
                 self.assertFalse(tool.annotations.destructive_hint)
+
+    async def test_collection_tools_preserve_evidence_filters_and_pagination(self):
+        cases = [
+            (
+                "get_project_external_identifiers",
+                {"project_id": 12},
+                "projects/12/external_identifiers",
+                "",
+                {
+                    "identifier": "ascl:example",
+                    "match_status": "ambiguous",
+                    "evidence": [{"source": "ascl"}],
+                },
+            ),
+            (
+                "list_package_versions",
+                {"package_id": 40},
+                "packages/40/versions",
+                "",
+                {"id": 7, "number": "1.0", "fetched_at": "2026-10-19T00:00:00Z"},
+            ),
+            (
+                "get_package_repositories",
+                {"package_id": 40},
+                "packages/40/repositories",
+                "",
+                {
+                    "id": 12,
+                    "relationships": [
+                        {
+                            "type": "paper",
+                            "role": "model_paper",
+                            "package_evidence": [{"source": "model_card"}],
+                        }
+                    ],
+                },
+            ),
+            (
+                "list_packages",
+                {
+                    "ecosystem": "cran",
+                    "domain": "physical-sciences",
+                    "field": "physics",
+                    "sort": "science_score",
+                },
+                "packages",
+                "&ecosystem=cran&domain=physical-sciences&field=physics&sort=science_score",
+                {"id": 40, "purl": "pkg:cran/stats", "rankings": {"downloads": 0.5}},
+            ),
+            (
+                "search_research_organizations",
+                {"query": "A&B", "country": "gb", "include_unlinked": True},
+                "research_organizations",
+                "&q=A%26B&country=gb&include_unlinked=true",
+                {"id": "02jx3x895", "source": {"current": True}},
+            ),
+            (
+                "list_research_accounts",
+                {},
+                "research_organizations/accounts",
+                "",
+                {"id": 1, "organization_matches": [{"relationship": "repository_owner"}]},
+            ),
+        ]
+        for section in ("owners", "projects", "packages"):
+            cases.append(
+                (
+                    "get_research_organization",
+                    {"ror_id": "02jx3x895", "section": section, "include_descendants": True},
+                    f"research_organizations/02jx3x895/{section}",
+                    "&include_descendants=true",
+                    {"id": 12},
+                )
+            )
+        async with self.client() as client:
+            for tool, args, path, filters, record in cases:
+                with self.subTest(tool=tool, args=args):
+                    first_path = f"/api/v1/{path}?page=1&per_page=1{filters}"
+                    second_path = f"/api/v1/{path}?page=2&per_page=1{filters}"
+                    self.api.responses[first_path] = (
+                        200,
+                        {"Link": '<https://untrusted.example/>; rel="next"'},
+                        [record],
+                    )
+                    self.api.responses[second_path] = (200, {}, [])
+                    first = await self.call(client, tool, {**args, "per_page": 1})
+                    self.assertEqual([record], first["items"])
+                    self.assertEqual("api", first["source"])
+                    self.assertIn("retrieved_at", first)
+                    self.assertEqual(2, first["next_page"])
+                    second = await self.call(
+                        client, tool, {**args, "per_page": 1, "page": first["next_page"]}
+                    )
+                    self.assertEqual([], second["items"])
+                    self.assertIsNone(second["next_page"])
+                    self.assertEqual([first_path, second_path], self.api.requests[-2:])
+
+    async def test_record_tools_keep_source_status_and_identity(self):
+        cases = [
+            (
+                "get_project_swhids",
+                {"project_id": 12},
+                "projects/12/swhids",
+                {"project_id": 12, "status": "unchecked", "bytes_verified": False, "objects": []},
+            ),
+            (
+                "get_package_version",
+                {"package_id": 40, "version_id": 7},
+                "packages/40/versions/7",
+                {"id": 7, "package_id": 40, "number": "1.0", "metadata": {"revision": "abc"}},
+            ),
+            (
+                "get_research_organization",
+                {"ror_id": "02jx3x895"},
+                "research_organizations/02jx3x895?include_descendants=false",
+                {
+                    "id": "02jx3x895",
+                    "source": {"current": True, "version": "fixture"},
+                    "coverage": {"relationship": "repository_owner"},
+                },
+            ),
+        ]
+        async with self.client() as client:
+            for tool, args, path, record in cases:
+                self.api.responses[f"/api/v1/{path}"] = (200, {}, record)
+                data = await self.call(client, tool, args)
+                self.assertEqual(record, data["record"])
+                self.assertEqual("api", data["source"])
+
+    async def test_bulk_lookups_send_json_and_preserve_unmatched_inputs(self):
+        cases = [
+            (
+                "bulk_lookup_projects",
+                "projects",
+                "repository_urls",
+                ["https://github.com/example/Stats", "https://github.com/missing/tool"],
+                [
+                    {
+                        "input_url": "https://github.com/example/Stats",
+                        "matches": [{"source": "repository_alias", "project": {"id": 12}}],
+                    },
+                    {"input_url": "https://github.com/missing/tool", "matches": []},
+                ],
+            ),
+            (
+                "bulk_lookup_packages",
+                "packages",
+                "purls",
+                ["pkg:npm/%40example/stats@1", "pkg:pypi/missing"],
+                [{"id": 40, "purl": "pkg:npm/%40example/stats"}],
+            ),
+        ]
+        async with self.client() as client:
+            for tool, resource, key, values, records in cases:
+                path = f"/api/v1/{resource}/bulk_lookup"
+                self.api.responses[path] = (200, {}, records)
+                data = await self.call(client, tool, {key: values})
+                self.assertEqual(values, data["inputs"])
+                self.assertEqual(records, data["items"])
+                self.assertEqual((path, {key: values}, "application/json"), self.api.posts[-1])
+
+    async def test_new_tools_report_missing_routes_and_invalid_response_shapes(self):
+        cases = [
+            (
+                "list_packages",
+                {},
+                "packages?page=1&per_page=10&ecosystem=&domain=&field=&sort=scientific_projects",
+                {},
+            ),
+            (
+                "list_package_versions",
+                {"package_id": 40},
+                "packages/40/versions?page=1&per_page=10",
+                ["invalid"],
+            ),
+            (
+                "get_project_external_identifiers",
+                {"project_id": 12},
+                "projects/12/external_identifiers?page=1&per_page=10",
+                [{}] * 11,
+            ),
+            ("get_project_swhids", {"project_id": 12}, "projects/12/swhids", []),
+            ("bulk_lookup_packages", {"purls": ["pkg:pypi/stats"]}, "packages/bulk_lookup", {}),
+        ]
+        async with self.client() as client:
+            for tool, args, path, invalid in cases:
+                for status, body, error in [
+                    (404, {}, "not_found"),
+                    (200, invalid, "invalid_response"),
+                ]:
+                    self.api.responses[f"/api/v1/{path}"] = (status, {}, body)
+                    result = await client.call_tool(tool, args)
+                    self.assertTrue(result.is_error)
+                    self.assertEqual(error, result.structured_content["error"])
+
+    async def test_new_tool_inputs_are_bounded_before_http_requests(self):
+        cases = [
+            ("get_project_external_identifiers", {"project_id": 1, "per_page": 26}),
+            ("get_project_swhids", {"project_id": True}),
+            ("bulk_lookup_projects", {"repository_urls": []}),
+            ("bulk_lookup_packages", {"purls": ["pkg:pypi/stats"] * 26}),
+            ("bulk_lookup_packages", {"purls": ["x" * 2001]}),
+            ("list_packages", {"sort": "invalid"}),
+            ("list_package_versions", {"package_id": 0}),
+            ("get_package_version", {"package_id": 40, "version_id": "../other"}),
+            ("get_package_repositories", {"package_id": 40, "page": 0}),
+            ("search_research_organizations", {"query": "x" * 201}),
+            ("search_research_organizations", {"country": "GBR"}),
+            ("get_research_organization", {"ror_id": "../accounts"}),
+            ("get_research_organization", {"ror_id": "02jx3x895", "section": "bad"}),
+            ("list_research_accounts", {"per_page": 26}),
+            ("list_package_versions", {"package_id": 40, "page": False}),
+        ]
+        async with self.client() as client:
+            for tool, args in cases:
+                with self.subTest(tool=tool):
+                    result = await client.call_tool(tool, args)
+                    self.assertTrue(result.is_error)
+        self.assertEqual([], self.api.requests)
+
+    async def test_extended_smoke_reports_errors_and_continues_independent_checks(self):
+        path = "/api/v1/software/search?q=orbdot&limit=5&after_id=0"
+        self.api.responses[path] = (200, {}, {"projects": [], "next_after_id": None})
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(ROOT / "scripts/smoke.py"),
+            "--extended",
+            cwd=str(ROOT),
+            env={**os.environ, "SCIENCE_API_URL": self.api.url, "SCIENCE_SEEDS_DB": ""},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        self.assertEqual(1, process.returncode, stderr.decode())
+        report = json.loads(stdout)
+        self.assertIn("list_seed_projects", report["failed"])
+        self.assertIn("list_packages", report["failed"])
+        self.assertNotIn("search_software", report["failed"])
+        self.assertEqual([], report["checks"]["search_software"]["projects"])
+        self.assertIn("skipped", report["checks"]["package_details"])
+        self.assertIn("skipped", report["checks"]["organization_details"])
 
     async def test_live_seed_page_preserves_provenance_and_pagination(self):
         seeds = [

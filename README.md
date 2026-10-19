@@ -1,6 +1,6 @@
 # Science MCP
 
-A local Python MCP server for [ecosyste.ms Science](https://science.ecosyste.ms). It searches software names, looks up identifiers, and reads descriptions, languages, package metadata, and dependencies through the Science API. Metadata extraction stays in Science.
+A local Python MCP server for [ecosyste.ms Science](https://science.ecosyste.ms). It searches software and institutions, resolves identifiers, and reads package metadata, dependencies, archive evidence, and repository relationships through the Science API. Metadata extraction stays in Science.
 
 ## Run locally
 
@@ -23,14 +23,31 @@ No local database or catalogue download is required. API lookup and search use S
 | `search_software` | Names containing at least three characters, including aliases and package names |
 | `list_seed_projects` | One page of live search seeds, with the next page number |
 | `get_project_context` | Live project summary, or a page of published packages or direct dependencies |
+| `get_project_external_identifiers` | Catalogue and journal identifiers, match status, source metadata, and evidence |
+| `get_project_swhids` | Stored Software Heritage identifiers and archive observations |
+| `bulk_lookup_projects` | Existing projects matching up to 25 repository URLs, including aliases |
+| `bulk_lookup_packages` | Stored packages matching up to 25 PURLs, including model packages |
+| `list_packages` | Packages ranked by scientific use, relevance, or repository Science Score |
+| `list_package_versions` | A page of stored versions with source metadata and release matches |
+| `get_package_version` | One stored version selected by its local ID |
+| `get_package_repositories` | Direct and paper-mediated repository relationships with evidence |
+| `search_research_organizations` | ROR institutions matching a name or alias, with an optional country filter |
+| `get_research_organization` | Institution summary, or a page of owners, projects, or packages |
+| `list_research_accounts` | Confirmed institutional repository accounts and matching evidence |
 
 Start with `lookup_software(query="orbdot")` or `search_software(query="orbit")`, then pass a returned `project_id` to `get_project_context`. Use `section="packages"` or `section="direct_dependencies"` for details. Follow `next_offset` with the same section and project.
+
+The additional collection tools return `items` and `next_page`. Keep the same filters and `per_page` when following pages. Detail tools return `record`, preserving any nested source metadata, alongside the API URL and retrieval time. Bulk project lookup retains unmatched inputs as empty match lists; bulk package lookup returns only unique matches after removing versions and subpaths from PURLs. Neither bulk endpoint creates or syncs records.
+
+Use a package ID from context or bulk lookup to retrieve versions and repositories. A version ID is the local numeric ID from `list_package_versions`, not the version string. Institution search returns nine-character ROR IDs for `get_research_organization`; its `include_descendants` option also applies to paginated sections. Confirmed repository ownership does not establish institutional authorship.
+
+Package repository relationships preserve both direct evidence and connections through shared papers. A shared paper does not establish that a repository publishes the package. Archive observations retain their status and dates; an SWHID alone does not establish archival coverage or verified bytes.
 
 API lookup and search return matching evidence grouped in `projects`. Preserve those sources and any competing identities. Follow `next_after_id` using the same query and kind until it is null; the API cursor is a project ID. Names use lowercase Unicode NFC, DOI URLs are accepted, and URL paths retain case. API PURL lookup removes versions and subpaths. Search matches literal substrings without fuzzy matching or confidence scores.
 
 A missing match is not proof that software is absent from Science. Live responses include retrieval time and source timestamps; index updates are asynchronous and pagination can change as metadata changes. Direct dependencies are project-level observations and do not imply that every package published by the project has those dependencies.
 
-Tool pages contain at most 25 matches or context items, and seed pages at most 10 projects. Long text and nested arrays have explicit `truncations` entries. Serialized result data is limited to 64 KiB; a larger result returns an error asking for a smaller page. The API still returns the full context to the adapter before it selects a page. Requests have a 15-second socket timeout and a 10 MiB response limit.
+Tool pages contain at most 25 matches or items, and seed pages at most 10 projects. Long text and nested arrays have explicit `truncations` entries. Serialized result data is limited to 64 KiB; a larger result returns an error asking for a smaller page. The API still returns the full search context to the adapter before it selects a page; the newer collection tools request pages from the service. Requests have a 15-second socket timeout and a 10 MiB response limit.
 
 ## Connect a client
 
@@ -84,8 +101,9 @@ uv run --locked python -m unittest discover -s tests -v
 uv run --locked ruff check src tests scripts
 uv run --locked ruff format --check src tests scripts
 uv run --locked python scripts/smoke.py
+uv run --locked python scripts/smoke.py --extended
 ```
 
-The tests start stdio subprocesses and a local HTTP fixture server. CI runs the suite on Python 3.11 through 3.14, with Ruff and zizmor checks. Dependabot checks Python dependencies and GitHub Actions weekly. The smoke script makes read-only requests to the configured Science API and, when configured, queries the local snapshot.
+The tests start stdio subprocesses and a local HTTP fixture server. CI runs the suite on Python 3.11 through 3.14, with Ruff and zizmor checks. Dependabot checks Python dependencies and GitHub Actions weekly. The smoke script makes read-only requests to the configured Science API and, when configured, queries the local snapshot. `--extended` also checks identifiers, archive evidence, package APIs, and institutions. The report identifies data-dependent checks that could not run, such as version details when the selected package has no stored versions.
 
 Released under the [MIT License](LICENSE).

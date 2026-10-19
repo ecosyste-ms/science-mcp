@@ -114,9 +114,15 @@ class FakeAPI:
     def __init__(self):
         self.responses = {}
         self.requests = []
+        self.posts = []
         state = self
 
         class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                state.posts.append((self.path, body, self.headers.get("Content-Type")))
+                self.do_GET()
+
             def do_GET(self):
                 state.requests.append(self.path)
                 status, headers, body = state.responses.get(self.path, (404, {}, b"not found"))
